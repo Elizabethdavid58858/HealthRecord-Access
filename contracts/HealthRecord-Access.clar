@@ -77,3 +77,168 @@
         (get verified (map-get? doctors doctor-principal))
     )
 )
+
+
+
+(define-read-only (is-registered-patient (patient-principal principal))
+    (default-to 
+        false
+        (get consent-status (map-get? patients patient-principal))
+    )
+)
+(define-read-only (is-registered-doctor (doctor-principal principal))
+    (default-to 
+        false
+        (get verified (map-get? doctors doctor-principal))
+    )
+)
+(define-read-only (get-consent-status (patient-principal principal))
+    (default-to 
+        false
+        (get consent-status (map-get? patients patient-principal))
+    )
+)
+(define-read-only (get-doctor-status (doctor-principal principal))
+    (default-to 
+        false
+        (get verified (map-get? doctors doctor-principal))
+    )
+)
+(define-read-only (get-patient-status (patient-principal principal))
+    (default-to 
+        false
+        (get consent-status (map-get? patients patient-principal))
+    )
+)
+(define-read-only (get-emergency-access (patient-principal principal) (doctor-principal principal))
+    (default-to 
+        false
+        (get emergency-access (map-get? access-permissions {patient: patient-principal, doctor: doctor-principal}))
+    )
+)
+(define-read-only (get-granted-access (patient-principal principal) (doctor-principal principal))
+    (default-to 
+        false
+        (get granted (map-get? access-permissions {patient: patient-principal, doctor: doctor-principal}))
+    )
+)
+(define-read-only (get-patient-consent-status (patient-principal principal))
+    (default-to 
+        false
+        (get consent-status (map-get? patients patient-principal))
+    )
+)
+(define-read-only (get-doctor-verified-status (doctor-principal principal))
+    (default-to 
+        false
+        (get verified (map-get? doctors doctor-principal))
+    )
+)
+
+
+
+;; Add to data maps
+(define-map access-durations
+    {patient: principal, doctor: principal}
+    {expiry: uint}
+)
+
+;; New functions
+(define-public (grant-timed-access (doctor-principal principal) (duration uint))
+    (let ((current-block stacks-block-height))
+        (if (get verified (default-to {verified: false} (map-get? doctors doctor-principal)))
+            (begin
+                (try! (grant-access doctor-principal))
+                (ok (map-set access-durations 
+                    {patient: tx-sender, doctor: doctor-principal}
+                    {expiry: (+ current-block duration)})))
+            err-not-authorized)
+    )
+)
+
+(define-read-only (is-access-valid (patient-principal principal) (doctor-principal principal))
+    (let ((expiry (get expiry (default-to {expiry: u0} (map-get? access-durations {patient: patient-principal, doctor: doctor-principal})))))
+        (< stacks-block-height expiry))
+)
+
+
+;; Add to data maps
+(define-map doctor-specializations
+    principal
+    {specialization: (string-ascii 30), certification: (string-ascii 50)}
+)
+
+;; New functions
+(define-public (add-specialization (specialization (string-ascii 30)) (certification (string-ascii 50)))
+    (if (is-verified-doctor tx-sender)
+        (ok (map-set doctor-specializations
+            tx-sender
+            {specialization: specialization, certification: certification}))
+        err-not-authorized)
+)
+
+(define-read-only (get-doctor-specialization (doctor-principal principal))
+    (default-to 
+        {specialization: "", certification: ""}
+        (map-get? doctor-specializations doctor-principal))
+)
+
+
+;; Add to data maps
+(define-map access-history
+    {patient: principal}
+    {accesses: (list 50 {doctor: principal, block: uint})}
+)
+
+;; New functions
+(define-public (log-access (patient-principal principal))
+    (let (
+        (current-history (default-to {accesses: (list )} (map-get? access-history {patient: patient-principal})))
+        (new-access {doctor: tx-sender, block: stacks-block-height})
+    )
+    (if (get granted (check-access patient-principal tx-sender))
+        (ok (map-set access-history
+            {patient: patient-principal}
+            {accesses: (unwrap! (as-max-len? (append (get accesses current-history) new-access) u50) err-not-authorized)}))
+        err-not-authorized))
+)
+
+(define-read-only (get-access-history (patient-principal principal))
+    (get accesses (default-to {accesses: (list )} (map-get? access-history {patient: patient-principal})))
+)
+
+
+;; Add to data maps
+(define-map sharing-preferences
+    principal
+    {research-allowed: bool, anonymous-sharing: bool, third-party-sharing: bool}
+)
+
+;; New functions
+(define-public (set-sharing-preferences (research-allowed bool) (anonymous-sharing bool) (third-party-sharing bool))
+    (if (is-some (map-get? patients tx-sender))
+        (ok (map-set sharing-preferences
+            tx-sender
+            {research-allowed: research-allowed, 
+             anonymous-sharing: anonymous-sharing, 
+             third-party-sharing: third-party-sharing}))
+        err-not-registered)
+)
+
+(define-read-only (get-sharing-preferences (patient-principal principal))
+    (default-to
+        {research-allowed: false, anonymous-sharing: false, third-party-sharing: false}
+        (map-get? sharing-preferences patient-principal))
+)
+
+
+(define-read-only (get-patient-sharing-preferences (patient-principal principal))
+    (default-to
+        {research-allowed: false, anonymous-sharing: false, third-party-sharing: false}
+        (map-get? sharing-preferences patient-principal))
+)
+(define-read-only (get-doctor-sharing-preferences (doctor-principal principal))
+    (default-to
+        {research-allowed: false, anonymous-sharing: false, third-party-sharing: false}
+        (map-get? sharing-preferences doctor-principal))
+)
