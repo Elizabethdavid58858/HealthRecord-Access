@@ -242,3 +242,137 @@
         {research-allowed: false, anonymous-sharing: false, third-party-sharing: false}
         (map-get? sharing-preferences doctor-principal))
 )
+
+
+
+;; Add to data maps
+(define-map emergency-responders
+    principal
+    {authorized: bool, organization: (string-ascii 50)}
+)
+
+(define-map emergency-access-logs
+    {patient: principal}
+    {logs: (list 20 {responder: principal, reason: (string-ascii 100), timestamp: uint})}
+)
+
+;; New functions
+(define-public (register-emergency-responder (responder-principal principal) (organization (string-ascii 50)))
+    (if (is-eq tx-sender contract-owner)
+        (ok (map-set emergency-responders
+            responder-principal
+            {authorized: true, organization: organization}))
+        err-not-authorized)
+)
+
+(define-public (emergency-access-override (patient-principal principal) (reason (string-ascii 100)))
+    (let (
+        (responder-status (default-to {authorized: false, organization: ""} (map-get? emergency-responders tx-sender)))
+        (current-logs (default-to {logs: (list)} (map-get? emergency-access-logs {patient: patient-principal})))
+        (new-log {responder: tx-sender, reason: reason, timestamp: stacks-block-height})
+    )
+        (if (get authorized responder-status)
+            (begin
+                (map-set access-permissions 
+                    {patient: patient-principal, doctor: tx-sender}
+                    {granted: true, emergency-access: true})
+                (map-set emergency-access-logs
+                    {patient: patient-principal}
+                    {logs: (unwrap! (as-max-len? (append (get logs current-logs) new-log) u20) err-not-authorized)})
+                (ok true))
+            err-not-authorized)
+    )
+)
+
+(define-public (revoke-emergency-access (patient-principal principal))
+    (if (or (is-eq tx-sender contract-owner) (is-eq tx-sender patient-principal))
+        (ok (map-set access-permissions 
+            {patient: patient-principal, doctor: tx-sender}
+            {granted: false, emergency-access: false}))
+        err-not-authorized)
+)
+
+(define-read-only (get-emergency-access-logs (patient-principal principal))
+    (get logs (default-to {logs: (list)} (map-get? emergency-access-logs {patient: patient-principal})))
+)
+
+(define-read-only (is-emergency-responder (responder-principal principal))
+    (get authorized (default-to {authorized: false, organization: ""} (map-get? emergency-responders responder-principal)))
+)
+
+
+;; Add to data maps
+(define-map delegated-managers
+    {patient: principal, delegate: principal}
+    {active: bool, relationship: (string-ascii 30), expiry: (optional uint)}
+)
+
+;; New functions
+(define-public (add-delegate (delegate-principal principal) (relationship (string-ascii 30)) (expiry (optional uint)))
+    (let (
+        (patient-exists (is-some (map-get? patients tx-sender)))
+    )
+        (if patient-exists
+            (ok (map-set delegated-managers
+                {patient: tx-sender, delegate: delegate-principal}
+                {active: true, relationship: relationship, expiry: expiry}))
+            err-not-registered)
+    )
+)
+
+(define-public (remove-delegate (delegate-principal principal))
+    (ok (map-delete delegated-managers {patient: tx-sender, delegate: delegate-principal}))
+)
+
+(define-public (delegate-grant-access (patient-principal principal) (doctor-principal principal))
+    (let (
+        (delegation-info (default-to {active: false, relationship: "", expiry: none} 
+                         (map-get? delegated-managers {patient: patient-principal, delegate: tx-sender})))
+        (doctor-exists (is-some (map-get? doctors doctor-principal)))
+        (current-block stacks-block-height)
+    )
+        (if (and 
+                (get active delegation-info)
+                doctor-exists
+                (match (get expiry delegation-info)
+                    expiry-value (< current-block expiry-value)
+                    true
+                )
+            )
+            (ok (map-set access-permissions 
+                {patient: patient-principal, doctor: doctor-principal}
+                {granted: true, emergency-access: false}))
+            err-not-authorized)
+    )
+)
+
+(define-public (delegate-revoke-access (patient-principal principal) (doctor-principal principal))
+    (let (
+        (delegation-info (default-to {active: false, relationship: "", expiry: none} 
+                         (map-get? delegated-managers {patient: patient-principal, delegate: tx-sender})))
+    )
+        (if (get active delegation-info)
+            (ok (map-delete access-permissions {patient: patient-principal, doctor: doctor-principal}))
+            err-not-authorized)
+    )
+)
+
+;; (define-read-only (get-patient-delegates (patient-principal principal))
+;;     (map-keys delegated-managers {patient: patient-principal, delegate: principal})
+;; )
+
+(define-read-only (is-active-delegate (patient-principal principal) (delegate-principal principal))
+    (let (
+        (delegation-info (default-to {active: false, relationship: "", expiry: none} 
+                         (map-get? delegated-managers {patient: patient-principal, delegate: delegate-principal})))
+        (current-block stacks-block-height)
+    )
+        (and 
+            (get active delegation-info)
+            (match (get expiry delegation-info)
+                expiry-value (< current-block expiry-value)
+                true
+            )
+        )
+    )
+)
