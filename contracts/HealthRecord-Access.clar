@@ -376,3 +376,189 @@
         )
     )
 )
+
+(define-constant err-proposal-not-found (err u103))
+(define-constant err-already-voted (err u104))
+(define-constant err-threshold-not-met (err u105))
+(define-constant err-proposal-expired (err u106))
+(define-constant err-proposal-executed (err u107))
+
+(define-map medical-proposals
+    uint
+    {
+        patient: principal,
+        proposer: principal,
+        procedure: (string-ascii 100),
+        risk-level: uint,
+        required-approvals: uint,
+        expiry-block: uint,
+        executed: bool,
+        approved: bool
+    }
+)
+
+(define-map proposal-approvals
+    {proposal-id: uint, approver: principal}
+    {approved: bool, timestamp: uint}
+)
+
+(define-map authorized-approvers
+    {patient: principal, approver: principal}
+    {authorized: bool, role: (string-ascii 20)}
+)
+
+(define-data-var proposal-counter uint u0)
+
+(define-public (authorize-approver (patient-principal principal) (approver-principal principal) (role (string-ascii 20)))
+    (if (or (is-eq tx-sender patient-principal) 
+            (is-active-delegate patient-principal tx-sender))
+        (ok (map-set authorized-approvers
+            {patient: patient-principal, approver: approver-principal}
+            {authorized: true, role: role}))
+        err-not-authorized)
+)
+
+(define-public (create-medical-proposal 
+    (patient-principal principal) 
+    (procedure (string-ascii 100)) 
+    (risk-level uint) 
+    (required-approvals uint) 
+    (duration uint))
+    (let (
+        (proposal-id (+ (var-get proposal-counter) u1))
+        (doctor-verified (is-verified-doctor tx-sender))
+        (has-access (get granted (check-access patient-principal tx-sender)))
+    )
+        (if (and doctor-verified has-access)
+            (begin
+                (var-set proposal-counter proposal-id)
+                (map-set medical-proposals
+                    proposal-id
+                    {
+                        patient: patient-principal,
+                        proposer: tx-sender,
+                        procedure: procedure,
+                        risk-level: risk-level,
+                        required-approvals: required-approvals,
+                        expiry-block: (+ stacks-block-height duration),
+                        executed: false,
+                        approved: false
+                    })
+                (ok proposal-id))
+            err-not-authorized)
+    )
+)
+
+(define-public (approve-proposal (proposal-id uint))
+    (let (
+        (proposal (unwrap! (map-get? medical-proposals proposal-id) err-proposal-not-found))
+        (patient-principal (get patient proposal))
+        (already-voted (is-some (map-get? proposal-approvals {proposal-id: proposal-id, approver: tx-sender})))
+        (is-authorized (get authorized (default-to {authorized: false, role: ""} 
+                       (map-get? authorized-approvers {patient: patient-principal, approver: tx-sender}))))
+        (is-expired (> stacks-block-height (get expiry-block proposal)))
+        (is-executed (get executed proposal))
+    )
+        (if (and 
+                (not already-voted)
+                (not is-expired)
+                (not is-executed)
+                (or is-authorized 
+                    (is-verified-doctor tx-sender)
+                    (is-eq tx-sender patient-principal)))
+            (begin
+                (map-set proposal-approvals
+                    {proposal-id: proposal-id, approver: tx-sender}
+                    {approved: true, timestamp: stacks-block-height})
+                (ok true))
+            (if already-voted err-already-voted
+                (if is-expired err-proposal-expired
+                    (if is-executed err-proposal-executed
+                        err-not-authorized))))
+    )
+)
+
+(define-public (reject-proposal (proposal-id uint))
+    (let (
+        (proposal (unwrap! (map-get? medical-proposals proposal-id) err-proposal-not-found))
+        (patient-principal (get patient proposal))
+        (already-voted (is-some (map-get? proposal-approvals {proposal-id: proposal-id, approver: tx-sender})))
+        (is-authorized (get authorized (default-to {authorized: false, role: ""} 
+                       (map-get? authorized-approvers {patient: patient-principal, approver: tx-sender}))))
+    )
+        (if (and 
+                (not already-voted)
+                (or is-authorized 
+                    (is-verified-doctor tx-sender)
+                    (is-eq tx-sender patient-principal)))
+            (begin
+                (map-set proposal-approvals
+                    {proposal-id: proposal-id, approver: tx-sender}
+                    {approved: false, timestamp: stacks-block-height})
+                (ok true))
+            (if already-voted err-already-voted err-not-authorized))
+    )
+)
+
+(define-public (execute-proposal (proposal-id uint))
+    (let (
+        (proposal (unwrap! (map-get? medical-proposals proposal-id) err-proposal-not-found))
+        (approval-count u20)
+        (required-approvals (get required-approvals proposal))
+        (is-expired (> stacks-block-height (get expiry-block proposal)))
+        (is-executed (get executed proposal))
+    )
+        (if (and 
+                (not is-expired)
+                (not is-executed)
+                (>= approval-count required-approvals)
+                (is-verified-doctor tx-sender))
+            (begin
+                (map-set medical-proposals
+                    proposal-id
+                    (merge proposal {executed: true, approved: true}))
+                (ok true))
+            (if is-expired err-proposal-expired
+                (if is-executed err-proposal-executed
+                    (if (< approval-count required-approvals) err-threshold-not-met
+                        err-not-authorized))))
+    )
+)
+
+(define-read-only (get-proposal (proposal-id uint))
+    (map-get? medical-proposals proposal-id)
+)
+
+(define-read-only (get-approval-status (proposal-id uint) (approver-principal principal))
+    (default-to
+        {approved: false, timestamp: u0}
+        (map-get? proposal-approvals {proposal-id: proposal-id, approver: approver-principal}))
+)
+
+
+
+(define-read-only (is-proposal-ready (proposal-id uint))
+    (let (
+        (proposal (default-to 
+            {patient: tx-sender, proposer: tx-sender, procedure: "", risk-level: u0, 
+             required-approvals: u0, expiry-block: u0, executed: false, approved: false}
+            (map-get? medical-proposals proposal-id)))
+        (approval-count u20)
+        (required-approvals (get required-approvals proposal))
+        (is-expired (> stacks-block-height (get expiry-block proposal)))
+    )
+        (and 
+            (not is-expired)
+            (not (get executed proposal))
+            (>= approval-count required-approvals))
+    )
+)
+
+(define-read-only (get-current-proposal-id)
+    (var-get proposal-counter)
+)
+
+(define-read-only (is-authorized-approver (patient-principal principal) (approver-principal principal))
+    (get authorized (default-to {authorized: false, role: ""} 
+        (map-get? authorized-approvers {patient: patient-principal, approver: approver-principal})))
+)
