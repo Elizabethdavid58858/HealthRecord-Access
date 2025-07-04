@@ -307,7 +307,220 @@
     {active: bool, relationship: (string-ascii 30), expiry: (optional uint)}
 )
 
+
+
 ;; New functions
+
+
+(define-constant err-invalid-validator (err u108))
+(define-constant err-insufficient-validators (err u109))
+(define-constant err-validation-expired (err u110))
+(define-constant err-data-already-validated (err u111))
+(define-constant err-validation-threshold-not-met (err u112))
+
+(define-map data-validators
+    principal
+    {
+        active: bool,
+        specialty: (string-ascii 40),
+        validation-count: uint,
+        reputation-score: uint
+    }
+)
+
+(define-map data-validation-proposals
+    uint
+    {
+        patient: principal,
+        data-hash: (string-ascii 64),
+        data-type: (string-ascii 30),
+        submitter: principal,
+        required-validations: uint,
+        expiry-block: uint,
+        validated: bool,
+        validation-count: uint
+    }
+)
+
+(define-map validation-votes
+    {proposal-id: uint, validator: principal}
+    {
+        approved: bool,
+        notes: (string-ascii 200),
+        timestamp: uint
+    }
+)
+
+(define-data-var validation-proposal-counter uint u0)
+
+(define-public (register-data-validator (validator-principal principal) (specialty (string-ascii 40)))
+    (if (is-eq tx-sender contract-owner)
+        (ok (map-set data-validators
+            validator-principal
+            {
+                active: true,
+                specialty: specialty,
+                validation-count: u0,
+                reputation-score: u100
+            }))
+        err-not-authorized)
+)
+
+(define-public (submit-data-for-validation 
+    (patient-principal principal) 
+    (data-hash (string-ascii 64)) 
+    (data-type (string-ascii 30))
+    (required-validations uint)
+    (duration uint))
+    (let (
+        (proposal-id (+ (var-get validation-proposal-counter) u1))
+        (has-access (get granted (check-access patient-principal tx-sender)))
+        (is-verified (is-verified-doctor tx-sender))
+    )
+        (if (and has-access is-verified)
+            (begin
+                (var-set validation-proposal-counter proposal-id)
+                (map-set data-validation-proposals
+                    proposal-id
+                    {
+                        patient: patient-principal,
+                        data-hash: data-hash,
+                        data-type: data-type,
+                        submitter: tx-sender,
+                        required-validations: required-validations,
+                        expiry-block: (+ stacks-block-height duration),
+                        validated: false,
+                        validation-count: u0
+                    })
+                (ok proposal-id))
+            err-not-authorized)
+    )
+)
+
+(define-public (validate-data (proposal-id uint) (approved bool) (notes (string-ascii 200)))
+    (let (
+        (proposal (unwrap! (map-get? data-validation-proposals proposal-id) err-proposal-not-found))
+        (validator-info (unwrap! (map-get? data-validators tx-sender) err-invalid-validator))
+        (already-voted (is-some (map-get? validation-votes {proposal-id: proposal-id, validator: tx-sender})))
+        (is-expired (> stacks-block-height (get expiry-block proposal)))
+        (is-validated (get validated proposal))
+    )
+        (if (and 
+                (get active validator-info)
+                (not already-voted)
+                (not is-expired)
+                (not is-validated))
+            (let (
+                (current-count (get validation-count proposal))
+                (new-count (+ current-count u1))
+                (required-count (get required-validations proposal))
+            )
+                (map-set validation-votes
+                    {proposal-id: proposal-id, validator: tx-sender}
+                    {approved: approved, notes: notes, timestamp: stacks-block-height})
+                (map-set data-validation-proposals
+                    proposal-id
+                    (merge proposal {validation-count: new-count}))
+                (map-set data-validators
+                    tx-sender
+                    (merge validator-info {validation-count: (+ (get validation-count validator-info) u1)}))
+                (if (and approved (>= new-count required-count))
+                    (begin
+                        (map-set data-validation-proposals
+                            proposal-id
+                            (merge proposal {validated: true, validation-count: new-count}))
+                        (ok {validated: true, count: new-count}))
+                    (ok {validated: false, count: new-count})))
+            (if already-voted err-already-voted
+                (if is-expired err-validation-expired
+                    (if is-validated err-data-already-validated
+                        err-invalid-validator))))
+    )
+)
+
+(define-public (finalize-validation (proposal-id uint))
+    (let (
+        (proposal (unwrap! (map-get? data-validation-proposals proposal-id) err-proposal-not-found))
+        (validation-count (get validation-count proposal))
+        (required-count (get required-validations proposal))
+        (is-expired (> stacks-block-height (get expiry-block proposal)))
+        (is-validated (get validated proposal))
+    )
+        (if (and 
+                (not is-expired)
+                (not is-validated)
+                (>= validation-count required-count)
+                (is-verified-doctor tx-sender))
+            (begin
+                (map-set data-validation-proposals
+                    proposal-id
+                    (merge proposal {validated: true}))
+                (ok true))
+            (if is-expired err-validation-expired
+                (if is-validated err-data-already-validated
+                    (if (< validation-count required-count) err-validation-threshold-not-met
+                        err-not-authorized))))
+    )
+)
+
+(define-public (deactivate-validator (validator-principal principal))
+    (if (is-eq tx-sender contract-owner)
+        (let (
+            (validator-info (unwrap! (map-get? data-validators validator-principal) err-invalid-validator))
+        )
+            (ok (map-set data-validators
+                validator-principal
+                (merge validator-info {active: false}))))
+        err-not-authorized)
+)
+
+(define-read-only (get-validation-proposal (proposal-id uint))
+    (map-get? data-validation-proposals proposal-id)
+)
+
+(define-read-only (get-validator-info (validator-principal principal))
+    (map-get? data-validators validator-principal)
+)
+
+(define-read-only (get-validation-vote (proposal-id uint) (validator-principal principal))
+    (map-get? validation-votes {proposal-id: proposal-id, validator: validator-principal})
+)
+
+(define-read-only (is-data-validated (proposal-id uint))
+    (let (
+        (proposal (map-get? data-validation-proposals proposal-id))
+    )
+        (match proposal
+            proposal-data (get validated proposal-data)
+            false)
+    )
+)
+
+(define-read-only (get-current-validation-id)
+    (var-get validation-proposal-counter)
+)
+
+(define-read-only (is-active-validator (validator-principal principal))
+    (let (
+        (validator-info (map-get? data-validators validator-principal))
+    )
+        (match validator-info
+            info (get active info)
+            false)
+    )
+)
+
+(define-read-only (get-validator-reputation (validator-principal principal))
+    (let (
+        (validator-info (map-get? data-validators validator-principal))
+    )
+        (match validator-info
+            info (get reputation-score info)
+            u0)
+    )
+)
+
+
 (define-public (add-delegate (delegate-principal principal) (relationship (string-ascii 30)) (expiry (optional uint)))
     (let (
         (patient-exists (is-some (map-get? patients tx-sender)))
