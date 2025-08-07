@@ -775,3 +775,296 @@
     (get authorized (default-to {authorized: false, role: ""} 
         (map-get? authorized-approvers {patient: patient-principal, approver: approver-principal})))
 )
+
+;; Medical Record Versioning and Audit Trail System
+;; Constants for versioning system
+(define-constant err-record-not-found (err u113))
+(define-constant err-version-not-found (err u114))
+(define-constant err-invalid-record-type (err u115))
+(define-constant err-unauthorized-modification (err u116))
+(define-constant err-rollback-not-allowed (err u117))
+
+;; Data structures for medical record versioning
+(define-map medical-records
+    {patient: principal, record-id: uint}
+    {
+        record-type: (string-ascii 50),
+        current-version: uint,
+        created-by: principal,
+        created-at: uint,
+        is-active: bool,
+        encryption-key: (string-ascii 64)
+    }
+)
+
+(define-map record-versions
+    {patient: principal, record-id: uint, version: uint}
+    {
+        content-hash: (string-ascii 64),
+        modified-by: principal,
+        modified-at: uint,
+        change-reason: (string-ascii 150),
+        previous-hash: (optional (string-ascii 64)),
+        signature: (string-ascii 128)
+    }
+)
+
+(define-map audit-trail
+    {patient: principal, record-id: uint}
+    {
+        modifications: (list 100 {
+            version: uint,
+            action: (string-ascii 20),
+            modifier: principal,
+            timestamp: uint,
+            change-summary: (string-ascii 150)
+        })
+    }
+)
+
+(define-map record-permissions
+    {patient: principal, record-id: uint, accessor: principal}
+    {
+        can-read: bool,
+        can-modify: bool,
+        can-delete: bool,
+        granted-by: principal,
+        granted-at: uint
+    }
+)
+
+(define-data-var record-counter uint u0)
+
+;; Create new medical record with initial version
+(define-public (create-medical-record 
+    (patient-principal principal)
+    (record-type (string-ascii 50))
+    (content-hash (string-ascii 64))
+    (encryption-key (string-ascii 64))
+    (signature (string-ascii 128)))
+    (let (
+        (record-id (+ (var-get record-counter) u1))
+        (has-access (get granted (check-access patient-principal tx-sender)))
+        (is-doctor (is-verified-doctor tx-sender))
+        (is-patient (is-eq tx-sender patient-principal))
+    )
+        (if (and (or has-access is-patient) is-doctor)
+            (begin
+                ;; Update record counter
+                (var-set record-counter record-id)
+                
+                ;; Create main record entry
+                (map-set medical-records
+                    {patient: patient-principal, record-id: record-id}
+                    {
+                        record-type: record-type,
+                        current-version: u1,
+                        created-by: tx-sender,
+                        created-at: stacks-block-height,
+                        is-active: true,
+                        encryption-key: encryption-key
+                    })
+                
+                ;; Create initial version
+                (map-set record-versions
+                    {patient: patient-principal, record-id: record-id, version: u1}
+                    {
+                        content-hash: content-hash,
+                        modified-by: tx-sender,
+                        modified-at: stacks-block-height,
+                        change-reason: "Initial record creation",
+                        previous-hash: none,
+                        signature: signature
+                    })
+                
+                ;; Initialize audit trail
+                (map-set audit-trail
+                    {patient: patient-principal, record-id: record-id}
+                    {
+                        modifications: (list {
+                            version: u1,
+                            action: "CREATE",
+                            modifier: tx-sender,
+                            timestamp: stacks-block-height,
+                            change-summary: "Medical record created"
+                        })
+                    })
+                
+                (ok record-id))
+            err-not-authorized)
+    )
+)
+
+;; Update existing medical record with new version
+(define-public (update-medical-record
+    (patient-principal principal)
+    (record-id uint)
+    (new-content-hash (string-ascii 64))
+    (change-reason (string-ascii 150))
+    (signature (string-ascii 128)))
+    (let (
+        (record (unwrap! (map-get? medical-records {patient: patient-principal, record-id: record-id}) err-record-not-found))
+        (current-version (get current-version record))
+        (new-version (+ current-version u1))
+        (current-version-data (map-get? record-versions {patient: patient-principal, record-id: record-id, version: current-version}))
+        (has-permission (get can-modify (default-to {can-read: false, can-modify: false, can-delete: false, granted-by: tx-sender, granted-at: u0}
+                        (map-get? record-permissions {patient: patient-principal, record-id: record-id, accessor: tx-sender}))))
+        (is-owner (is-eq tx-sender patient-principal))
+        (current-trail (default-to {modifications: (list)} (map-get? audit-trail {patient: patient-principal, record-id: record-id})))
+    )
+        (if (and (get is-active record) (or has-permission is-owner))
+            (begin
+                ;; Update main record with new version number
+                (map-set medical-records
+                    {patient: patient-principal, record-id: record-id}
+                    (merge record {current-version: new-version}))
+                
+                ;; Create new version entry
+                (map-set record-versions
+                    {patient: patient-principal, record-id: record-id, version: new-version}
+                    {
+                        content-hash: new-content-hash,
+                        modified-by: tx-sender,
+                        modified-at: stacks-block-height,
+                        change-reason: change-reason,
+                        previous-hash: (match current-version-data
+                            version-data (some (get content-hash version-data))
+                            none),
+                        signature: signature
+                    })
+                
+                ;; Update audit trail
+                (map-set audit-trail
+                    {patient: patient-principal, record-id: record-id}
+                    {
+                        modifications: (unwrap! (as-max-len? 
+                            (append (get modifications current-trail) {
+                                version: new-version,
+                                action: "UPDATE",
+                                modifier: tx-sender,
+                                timestamp: stacks-block-height,
+                                change-summary: change-reason
+                            }) u100) err-not-authorized)
+                    })
+                
+                (ok new-version))
+            err-unauthorized-modification)
+    )
+)
+
+;; Grant record access permissions
+(define-public (grant-record-permission
+    (record-id uint)
+    (accessor-principal principal)
+    (can-read bool)
+    (can-modify bool)
+    (can-delete bool))
+    (let (
+        (record (unwrap! (map-get? medical-records {patient: tx-sender, record-id: record-id}) err-record-not-found))
+    )
+        (if (get is-active record)
+            (ok (map-set record-permissions
+                {patient: tx-sender, record-id: record-id, accessor: accessor-principal}
+                {
+                    can-read: can-read,
+                    can-modify: can-modify,
+                    can-delete: can-delete,
+                    granted-by: tx-sender,
+                    granted-at: stacks-block-height
+                }))
+            err-record-not-found)
+    )
+)
+
+;; Soft delete medical record
+(define-public (deactivate-medical-record (record-id uint))
+    (let (
+        (record (unwrap! (map-get? medical-records {patient: tx-sender, record-id: record-id}) err-record-not-found))
+        (current-trail (default-to {modifications: (list)} (map-get? audit-trail {patient: tx-sender, record-id: record-id})))
+    )
+        (if (get is-active record)
+            (begin
+                ;; Deactivate record
+                (map-set medical-records
+                    {patient: tx-sender, record-id: record-id}
+                    (merge record {is-active: false}))
+                
+                ;; Log deactivation in audit trail
+                (map-set audit-trail
+                    {patient: tx-sender, record-id: record-id}
+                    {
+                        modifications: (unwrap! (as-max-len? 
+                            (append (get modifications current-trail) {
+                                version: (get current-version record),
+                                action: "DEACTIVATE",
+                                modifier: tx-sender,
+                                timestamp: stacks-block-height,
+                                change-summary: "Record deactivated by patient"
+                            }) u100) err-not-authorized)
+                    })
+                
+                (ok true))
+            err-record-not-found)
+    )
+)
+
+;; Read-only functions for record retrieval
+(define-read-only (get-medical-record (patient-principal principal) (record-id uint))
+    (map-get? medical-records {patient: patient-principal, record-id: record-id})
+)
+
+(define-read-only (get-record-version (patient-principal principal) (record-id uint) (version uint))
+    (map-get? record-versions {patient: patient-principal, record-id: record-id, version: version})
+)
+
+(define-read-only (get-current-record-version (patient-principal principal) (record-id uint))
+    (let (
+        (record (map-get? medical-records {patient: patient-principal, record-id: record-id}))
+    )
+        (match record
+            record-data (map-get? record-versions {patient: patient-principal, record-id: record-id, version: (get current-version record-data)})
+            none)
+    )
+)
+
+(define-read-only (get-record-audit-trail (patient-principal principal) (record-id uint))
+    (get modifications (default-to {modifications: (list)} (map-get? audit-trail {patient: patient-principal, record-id: record-id})))
+)
+
+(define-read-only (get-record-permissions (patient-principal principal) (record-id uint) (accessor-principal principal))
+    (map-get? record-permissions {patient: patient-principal, record-id: record-id, accessor: accessor-principal})
+)
+
+(define-read-only (get-total-records)
+    (var-get record-counter)
+)
+
+(define-read-only (can-access-record (patient-principal principal) (record-id uint) (accessor-principal principal))
+    (let (
+        (permissions (map-get? record-permissions {patient: patient-principal, record-id: record-id, accessor: accessor-principal}))
+        (is-patient (is-eq accessor-principal patient-principal))
+        (has-general-access (get granted (check-access patient-principal accessor-principal)))
+    )
+        (or is-patient 
+            has-general-access
+            (match permissions
+                perm-data (get can-read perm-data)
+                false))
+    )
+)
+
+(define-read-only (verify-record-integrity (patient-principal principal) (record-id uint) (version uint))
+    (let (
+        (version-data (map-get? record-versions {patient: patient-principal, record-id: record-id, version: version}))
+    )
+        (match version-data
+            data (and 
+                (> (len (get content-hash data)) u0)
+                (> (len (get signature data)) u0)
+                (> (get modified-at data) u0))
+            false)
+    )
+)
+
+
+
